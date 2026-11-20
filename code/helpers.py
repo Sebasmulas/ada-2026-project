@@ -22,6 +22,11 @@ END = "2026-11-01"          # fixed end date, so a re-download gives the same sa
 SAMPLE_START = "2007-01-01" # first day of the analysis sample
 TRAIN_END = "2019-12-31"    # training: 2007-2019, test: 2020 onwards
 
+# ---------------------------------------------------------------- design, fixed before any forecast (see README)
+HORIZON = 5                 # forecast target: mean daily variance over t+1 ... t+5
+ROLL_WINDOW = 1000          # rolling estimation window, in trading days
+WICK_MAX = 0.25             # a bar is unusable if High/Low is more than 25% beyond both Open and Close (bad ticks)
+
 # ---------------------------------------------------------------- tickers
 # Yahoo Finance ticker -> (short name used in files, label for figures, group)
 TICKERS = {
@@ -33,6 +38,11 @@ TICKERS = {
     "AM.PA":     ("dassault",    "Dassault Aviation", "defence"),
     "^STOXX50E": ("stoxx50",     "EURO STOXX 50",     "market"),
 }
+
+# Implied volatility of the EURO STOXX 50 (VSTOXX): a control variable, not a forecast target.
+# Yahoo has listed it under different symbols, so notebook 01 tries each and keeps the longest series.
+VSTOXX_CANDIDATES = ["^V2TX", "V2TX.DE"]
+VSTOXX_CSV = DATA_RAW / "vstoxx.csv"
 
 GPR_URL = "https://www.matteoiacoviello.com/gpr_files/data_gpr_daily_recent.xls"
 GPR_XLS = DATA_RAW / "data_gpr_daily_recent.xls"
@@ -58,20 +68,41 @@ def load_gpr() -> pd.DataFrame:
     return g[["gpr", "acts", "threats"]]
 
 
-# ---------------------------------------------------------------- volatility
-def har_components(r: pd.Series) -> pd.DataFrame:
-    """HAR inputs from daily log returns r (in %), all on the same scale (average daily variance).
+def load_vstoxx() -> pd.Series:
+    """Daily VSTOXX close (annualised implied volatility, in %)."""
+    v = pd.read_csv(VSTOXX_CSV, index_col="Date", parse_dates=True)["Close"]
+    v = pd.to_numeric(v, errors="coerce").dropna().sort_index()
+    return v[v > 0]
 
-    rv_d   : r_t^2                          (today)
-    rv_w   : mean of r^2 over t-4 ... t     (past week)
-    rv_m   : mean of r^2 over t-21 ... t    (past month)
-    rv_fwd : mean of r^2 over t+1 ... t+5   (next week = the forecast target)
+
+# ---------------------------------------------------------------- volatility
+def daily_variance(p: pd.DataFrame) -> pd.Series:
+    """Range-based daily variance in %^2: overnight gap + Parkinson (1980) intraday range.
+
+    var_t = ln(Open_t / Close_{t-1})^2  +  ln(High_t / Low_t)^2 / (4 ln 2)
+
+    The overnight term is needed because the range only covers trading hours, while a
+    close-to-close return also contains the gap from yesterday's close to today's open.
     """
-    r2 = r**2
-    out = pd.DataFrame(index=r.index)
-    out["rv_d"] = r2
-    out["rv_w"] = r2.rolling(5).mean()
-    out["rv_m"] = r2.rolling(22).mean()
-    # shift(-5) moves the mean of t+1..t+5 back to row t
-    out["rv_fwd"] = r2.rolling(5).mean().shift(-5)
+    overnight = np.log(p["Open"] / p["Close"].shift(1)) ** 2
+    parkinson = np.log(p["High"] / p["Low"]) ** 2 / (4 * np.log(2))
+    return (1e4 * (overnight + parkinson)).dropna()
+
+
+def har_components(v: pd.Series) -> pd.DataFrame:
+    """HAR inputs from a daily variance series v (in %^2), all on the same scale.
+
+    The series can be a range-based estimator (daily_variance) or squared returns r^2.
+
+    rv_d   : v_t                            (today)
+    rv_w   : mean of v over t-4 ... t       (past week)
+    rv_m   : mean of v over t-21 ... t      (past month)
+    rv_fwd : mean of v over t+1 ... t+5     (next week = the forecast target)
+    """
+    out = pd.DataFrame(index=v.index)
+    out["rv_d"] = v
+    out["rv_w"] = v.rolling(5).mean()
+    out["rv_m"] = v.rolling(22).mean()
+    # shift(-HORIZON) moves the mean of t+1..t+HORIZON back to row t
+    out["rv_fwd"] = v.rolling(HORIZON).mean().shift(-HORIZON)
     return out
